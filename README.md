@@ -35,7 +35,7 @@ ALTER TABLE customers SET (autovacuum_vacuum_scale_factor = 0.05);
 
 ### 2.2 📉 `items_products_join` — full re-agg evr call
 - query: revenue by category `\` `JOIN order_items+products` + `GROUP BY`, no real-time need
-```
+```sql
 SELECT
     p.category,
     COUNT(*) AS items_sold,
@@ -92,7 +92,7 @@ CREATE TABLE events_2026_06 PARTITION OF events
 
 ### 2.4 🐢 `heavy_join` — Seq Scan, low-selectivity filter
 - `status='active'` removes 13258/20000 rows via Seq Scan ⇒ wasted scan of whole tbl
-```
+```sql
 SELECT
     c.customer_id,
     c.full_name,
@@ -126,7 +126,7 @@ Heap Fetches: 0  \\ Buffers: shared hit=34
 
 ### 2.5 🐢 `orders_by_city_and_status` — `LIKE '%a%'` + Seq Scan
 - `LIKE '%pattern%'` not sargable[no prefix match for btree] ⇒ forced Seq Scan, 97580 rows removed by filter
-```
+```sql
 SELECT *
 FROM orders
 WHERE delivery_city LIKE '%a%'
@@ -153,8 +153,7 @@ Buffers: shared hit=3398
 
 ### 2.6 ✅ `search_customer_by_email` — false alarm
 - `WHERE email LIKE '%gmail%'` ⇒ 0 rows match [fake data domains ≠ gmail] ⇒ already <5ms
-```
-explain ANALYSE
+```sql
 SELECT *
 FROM customers
 WHERE email LIKE '%gmail%';
@@ -173,15 +172,15 @@ SELECT blocked.pid blocked_pid, blocked.query blocked_query,
 FROM pg_stat_activity blocked
 JOIN pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid));
 ```
-- live chain captured during run[3 wait types observed]:
-    - `phone` update wait on `status` update ← `wait_event=transactionid`[same row, diff tx, waiting on commit]
-    - `city` update wait on `phone` update ← `wait_event=tuple`[row-lvl]
-    - `orders.status` update wait on `LOCK TABLE orders SHARE ROW EXCLUSIVE` ← `wait_event=relation`[tbl-lvl]
+- live chain captured during run [3 wait types observed]:
+    - `phone` update wait on `status` update ← `wait_event=transactionid` [same row, diff tx, waiting on commit]
+    - `city` update wait on `phone` update ← `wait_event=tuple` [row-lvl]
+    - `orders.status` update wait on `LOCK TABLE orders SHARE ROW EXCLUSIVE` ← `wait_event=relation` [tbl-lvl]
 - `wait_event` tell lock granularity: `tuple`=row `\` `transactionid`=waiting other tx finish `\` `relation`=whole tbl
 
 ### 3.2 ⚠️ Reproduced intentional deadlock
-- tx1 lock cust2 → cust1[`city`] `\` tx2 lock cust2 → cust1 too, but real conflict version[in script] lock cust1→cust2 vs cust2→cust1[opposite order]
-- result: Postgres detect lock cycle[`deadlock_timeout`] → 1 tx get `deadlock_detected` error + auto-rollback
+- tx1 lock cust2 → cust1 [`city`] `\` tx2 lock cust2 → cust1 too, but real conflict version [in script] lock cust1→cust2 vs cust2→cust1 [opposite order]
+- result: Postgres detect lock cycle [`deadlock_timeout`] → 1 tx get `deadlock_detected` error + auto-rollback
 
 ### 3.3 🛠️ Fix — consistent lock order
 - root cause: 2 tx acquire same rows in **diff order** ⇒ circular wait possible ← not "too much locking", just "inconsistent order"
@@ -194,7 +193,7 @@ WITH lock_order AS (
 UPDATE customers SET city=city WHERE customer_id IN(SELECT customer_id FROM lock_order);
 ```
 - before: deadlock error ⇒ tx abort, app must retry
-- after: tx2 simply **wait** for tx1 commit → proceeds normally, 0 errors[serialized not cancelled]
+- after: tx2 simply **wait** for tx1 commit → proceeds normally, 0 errors [serialized not cancelled]
 
 ### 3.4 🎯 General tx hygiene
 - commit asap `\` split long tx → smaller tx w/ multiple commits `\` move non-essential work outside tx ⇒ <lock hold time
@@ -211,13 +210,11 @@ UPDATE customers SET city=city WHERE customer_id IN(SELECT customer_id FROM lock
 | heavy_join | 2.1ms `\` Seq Scan | 0.5ms `\` Idx Only Scan | partial idx |
 | orders_by_city_and_status | 74.9ms `\` Seq Scan | 8.8ms `\` Idx Scan | partial idx |
 | search_customer_by_email | <5ms | <5ms[no change] | n/a, already optimal |
-| customers deadlock(1,2) | tx abort w/ error | tx serialize, 0 error | ordered locking[`FOR UPDATE`+sort] |
+| customers deadlock(1,2) | tx abort w/ error | tx serialize, 0 error | ordered locking [`FOR UPDATE`+sort] |
 | customers autovacuum | stale stats, est≠actual | stats stay current | `autovacuum_vacuum_scale_factor=0.05` |
 
 ---
 
 ## 📎 References
 
-- 
-- 
-- 
+- [Claude.ai](https://claude.ai/share/65e4af13-ab68-4fee-88fe-4a0c1f4b40cd)
