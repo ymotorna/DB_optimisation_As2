@@ -13,51 +13,6 @@ ORDER BY total_exec_time DESC
 LIMIT 100;
 
 
---  Identify blocked sessions and their corresponding blocking sessions
-SELECT
-blocked.pid AS blocked_pid,
-blocked.usename AS blocked_user,
-blocked.query AS blocked_query,
-blocking.pid AS blocking_pid,
-blocking.usename AS blocking_user,
-blocking.query AS blocking_query,
-blocked.wait_event_type,
-blocked.wait_event
-FROM pg_stat_activity blocked
-JOIN pg_stat_activity blocking
-ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-ORDER BY blocked.pid;
-
-
--- Detect long-running transactions that may be causing lock contention
-SELECT
-pid,
-usename,
-state,
-xact_start,
-now() - xact_start AS transaction_duration,
-query
-FROM pg_stat_activity
-WHERE xact_start IS NOT NULL
-ORDER BY xact_start;
-
-
--- List active sessions currently waiting to acquire a lock
-SELECT
-pid,
-usename,
-state,
-wait_event_type,
-wait_event,
-query_start,
-now() - query_start AS running_for,
-query
-FROM pg_stat_activity
-WHERE wait_event_type = 'Lock';
-
-
-
-
 
 -- ---------------- listed by pg_stat_statements tot_exec_time desc
 -- 1) -------------------------------------------------------------------------------------------
@@ -81,9 +36,21 @@ UPDATE customers
 SET status = $1
 WHERE customer_id = $2
 
+-- problem
+-- many updates made for customers => EXPLAIN ANALYZE later shows very diff stat for estimated/real
+--   => change autovacuum for 5% instead of 20%
+select name, setting, short_desc
+FROM pg_settings
+WHERE name = 'autovacuum_vacuum_scale_factor';
+
+SELECT relname, reloptions
+FROM pg_class
+WHERE relname = 'customers';
+
+ALTER TABLE customers SET (autovacuum_vacuum_scale_factor = 0.05);
 
 
---  query to optimize  --------------------
+--  queries to optimize  --------------------
 
 -- 2) -------------------------------------------------------------------------------------------
 -- items_products_join ----------------------------------------------------------------------
@@ -205,7 +172,6 @@ SELECT DISTINCT
     )
 FROM customer_events_wide;
 
--- 2. one session per event row — no ambiguous JOIN
 -- first add a surrogate key to campaigns to make lookup fast
 ALTER TABLE campaigns ADD COLUMN utm_hash TEXT
     GENERATED ALWAYS AS (
@@ -231,7 +197,6 @@ JOIN campaigns c
         COALESCE(w.utm_campaign,'')
     );
 
--- 3. events linked to their newly created session
 -- row_number() matches each event to its corresponding session in insertion order
 WITH ordered_events AS (
     SELECT
@@ -261,7 +226,7 @@ SELECT
 FROM ordered_events oe
 JOIN ordered_sessions os ON os.rn = oe.rn;
 
-select * from events limit 2;
+
 --  old queries ------------------------------------------------------------
 -- events_aggregation ------------------------------
 explain ANALYSE
@@ -326,7 +291,8 @@ WHERE c.status IN ('active', 'inactive')
 
 -- 4) -------------------------------------------------------------------------------------------
 -- heavy_join ---------------------------------------------------------------------------------
-vacuum customers;
+
+-- vacuum customers;
 explain ANALYSE
 SELECT
     c.customer_id,
@@ -397,15 +363,198 @@ FROM customers
 WHERE email LIKE '%gmail%';
 
 -- all rows are filtered out
--- takes 5sec
+-- takes <5ms  => didnt do anything
 
 
 -- 7) -------------------------------------------------------------------------------------------
 
+--  Identify blocked sessions and their corresponding blocking sessions
+SELECT
+blocked.pid AS blocked_pid,
+blocked.usename AS blocked_user,
+blocked.query AS blocked_query,
+blocking.pid AS blocking_pid,
+blocking.usename AS blocking_user,
+blocking.query AS blocking_query,
+blocked.wait_event_type,
+blocked.wait_event
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+ORDER BY blocked.pid;
+
+-- example  \\  to build chain for report as example of what could happen
+-- 2280,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 4;
+--         ",19848,postgres,"
+--                     UPDATE customers
+--                     SET status = 'active'
+--                     WHERE customer_id = 4;
+--                 ",Lock,transactionid
+-- 4100,postgres,"
+--                     UPDATE customers
+--                     SET city = city
+--                     WHERE customer_id = 4;
+--                 ",2280,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 4;
+--         ",Lock,tuple
+-- 6448,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE orders
+--         SET status = 'paid'
+--         WHERE order_id = 81157;
+--         ",27684,postgres,LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE;,Lock,relation
+-- 8332,postgres,"
+--                     UPDATE customers
+--                     SET city = city
+--                     WHERE customer_id = 2;
+--                 ",21044,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 2;
+--         ",Lock,tuple
+-- 19876,postgres,"
+--                     UPDATE customers
+--                     SET country = country
+--                     WHERE customer_id = 4;
+--                 ",4100,postgres,"
+--                     UPDATE customers
+--                     SET city = city
+--                     WHERE customer_id = 4;
+--                 ",Lock,tuple
+-- 19876,postgres,"
+--                     UPDATE customers
+--                     SET country = country
+--                     WHERE customer_id = 4;
+--                 ",2280,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 4;
+--         ",Lock,tuple
+-- 21044,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 2;
+--         ",22952,postgres,"
+--                     UPDATE customers
+--                     SET status = 'active'
+--                     WHERE customer_id = 2;
+--                 ",Lock,transactionid
+-- 34436,postgres,"
+--                     UPDATE customers
+--                     SET country = country
+--                     WHERE customer_id = 2;
+--                 ",8332,postgres,"
+--                     UPDATE customers
+--                     SET city = city
+--                     WHERE customer_id = 2;
+--                 ",Lock,tuple
+-- 34436,postgres,"
+--                     UPDATE customers
+--                     SET country = country
+--                     WHERE customer_id = 2;
+--                 ",21044,postgres,"
+--         SET lock_timeout = '20s';
+--         UPDATE customers
+--         SET phone = 'changed_' || NOW()::TEXT
+--         WHERE customer_id = 2;
+--         ",Lock,tuple
+
+-- tx1 from deadlock --------------------------------------------------------
+-- wrong way => deadlock
+begin;
+UPDATE customers
+SET city = city
+where customer_id=2;
+
+
+begin;
+with lock_order as (
+    select customer_id
+    from customers
+    where customer_id in(1,2)
+    order by customer_id
+    for UPDATE      -- lock evr row as reads: reqd r1 -> lockr1 -> read r2 -> lock r2  => nbd can touch it
+)
+UPDATE customers
+SET city = city
+WHERE customer_id IN (SELECT customer_id FROM lock_order);
+COMMIT;
+
+-- -- tx 2 from deadlock  \\  opened in other console
+-- -- wromg way
+-- begin;
+-- UPDATE customers
+-- SET country=country
+-- where customer_id=2;
+-- 
+-- UPDATE customers
+-- SET country=country
+-- where customer_id=1;
+-- 
+-- -- good way
+-- begin;
+-- with lock_order as (
+--     select customer_id
+--     from customers
+--     where customer_id in(1,2)
+--     order by customer_id
+--     for UPDATE      -- lock evr row as reads: reqd r1 -> lockr1 -> read r2 -> lock r2  => nbd can touch it
+-- )
+-- UPDATE customers
+-- SET country=country
+-- WHERE customer_id IN (SELECT customer_id FROM lock_order);
+-- COMMIT;
+
+--    results
+-- before: deadlock error
+-- after: tx2 was waiting for tx1 to commit, after that started query successfully => no deadlock occurred
 
 
 
 
+
+
+-- Detect long-running transactions that may be causing lock contention
+SELECT
+pid,
+usename,
+state,
+xact_start,
+now() - xact_start AS transaction_duration,
+query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start;
+
+
+-- List active sessions currently waiting to acquire a lock
+SELECT
+pid,
+usename,
+state,
+wait_event_type,
+wait_event,
+query_start,
+now() - query_start AS running_for,
+query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock';
+
+
+
+-- additional notes/ideas
+-- for long transactions try to commit as fast as possible/divide tx into smaller tx with multiple commits / try to avoid unnecessary actios inside tx if couls be done outside of it
+-- ...here 1 example for each case
 
 
 
